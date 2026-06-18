@@ -28,6 +28,7 @@ ROOT_RE = re.compile(r"^usb(?P<bus>\d+)$")
 DEVICE_RE = re.compile(r"^(?P<bus>\d+)-(?P<ports>\d+(?:\.\d+)*)$")
 PORT_DIR_RE = re.compile(r".+-port(?P<port>\d+)$")
 META_FIELDS = ("name", "role", "notes")
+META_FILTERS = ("all", "with", "without")
 
 USB_CLASS_NAMES = {
     "00": "Per-interface",
@@ -216,6 +217,7 @@ class AppState:
     last_scan: float = 0.0
     pending_power: PendingPowerAction | None = None
     meta_edit: MetaEditorState | None = None
+    meta_filter: str = "all"
     status_message: str | None = None
     status_until: float = 0.0
 
@@ -507,6 +509,20 @@ def format_meta_suffix(meta: PortMeta | None) -> str:
     return " <meta>"
 
 
+def has_meta_content(meta: PortMeta | None) -> bool:
+    if not meta:
+        return False
+    return any((meta.name.strip(), meta.role.strip(), meta.notes.strip()))
+
+
+def meta_matches_filter(meta: PortMeta | None, meta_filter: str) -> bool:
+    if meta_filter == "with":
+        return has_meta_content(meta)
+    if meta_filter == "without":
+        return not has_meta_content(meta)
+    return True
+
+
 def read_interface(path: Path) -> UsbInterface:
     return UsbInterface(
         name=path.name,
@@ -796,6 +812,7 @@ def build_rows(
     show_empty_ports: bool,
     highlighted: dict[str, float] | None = None,
     port_meta: dict[tuple[str, int], PortMeta] | None = None,
+    meta_filter: str = "all",
 ) -> list[ViewRow]:
     highlighted = highlighted or {}
     port_meta = port_meta or {}
@@ -825,7 +842,14 @@ def build_rows(
             port_status = snapshot.port_statuses.get((device.name, port))
             status_suffix = format_port_status_suffix(port_status)
             target = PowerTarget(uhubctl_location(device) or device.name, port, "")
-            meta_suffix = format_meta_suffix(port_meta.get(meta_key(target)))
+            metadata = port_meta.get(meta_key(target))
+            if not meta_matches_filter(metadata, meta_filter):
+                if child_name:
+                    child = snapshot.devices[child_name]
+                    if child.is_hub:
+                        append_hub_ports(child, depth)
+                continue
+            meta_suffix = format_meta_suffix(metadata)
             if child_name:
                 child = snapshot.devices[child_name]
                 prefix = "port %s [plugged]" % port
@@ -1154,6 +1178,7 @@ class UsbTui:
             self.state.show_empty_ports,
             self.state.highlighted_until,
             self.state.port_meta,
+            self.state.meta_filter,
         )
         self.state.last_scan = time.monotonic()
         if self.state.rows:
@@ -1204,6 +1229,7 @@ class UsbTui:
                 self.state.show_empty_ports,
                 self.state.highlighted_until,
                 self.state.port_meta,
+                self.state.meta_filter,
             )
             self.state.selected = min(self.state.selected, max(0, len(self.state.rows) - 1))
         elif key in (ord("o"), ord("O")):
@@ -1214,6 +1240,8 @@ class UsbTui:
             self.prepare_power_action("cycle")
         elif key in (ord("m"), ord("M")):
             self.open_meta_editor()
+        elif key in (ord("n"), ord("N")):
+            self.cycle_meta_filter()
         return False
 
     def move_selection(self, delta: int) -> None:
@@ -1238,8 +1266,20 @@ class UsbTui:
             self.state.show_empty_ports,
             self.state.highlighted_until,
             self.state.port_meta,
+            self.state.meta_filter,
         )
         self.state.selected = min(self.state.selected, max(0, len(self.state.rows) - 1))
+
+    def cycle_meta_filter(self) -> None:
+        current_index = META_FILTERS.index(self.state.meta_filter)
+        self.state.meta_filter = META_FILTERS[(current_index + 1) % len(META_FILTERS)]
+        self.rebuild_rows()
+        labels = {
+            "all": "showing all ports",
+            "with": "showing only ports with metadata",
+            "without": "showing only ports without metadata",
+        }
+        self.set_status(f"Metadata filter: {labels[self.state.meta_filter]}", seconds=3.0)
 
     def open_meta_editor(self) -> None:
         row = self.selected_row()
@@ -1419,7 +1459,7 @@ class UsbTui:
             self.draw_details(stdscr, content_top, content_height, split + 2, width - split - 2)
 
         self.draw_events(stdscr, events_y, footer_y - events_y, width)
-        help_text = "q quit | arrows/jk select | r/F5 rescan | s port state | e empty | m meta | o off | i on | c cycle"
+        help_text = "q quit | arrows/jk select | r/F5 rescan | s port state | e empty | m meta | n notes | o off | i on | c cycle"
         if self.state.pending_power:
             help_text = "Confirm power action: y run | n cancel | Esc cancel"
         if self.state.meta_edit:
@@ -1441,7 +1481,7 @@ class UsbTui:
         power_state_mode = "power state auto" if self.state.auto_refresh_power_state else "power state manual"
         status = (
             f"{plugged} devices | {hubs} hubs | empty ports {empty} | "
-            f"{refresh_mode} | {power_state_mode} | scanned {scanned}"
+            f"notes {self.state.meta_filter} | {refresh_mode} | {power_state_mode} | scanned {scanned}"
         )
         if snapshot.errors:
             status += f" | {len(snapshot.errors)} read errors"
@@ -1594,6 +1634,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-force", action="store_true", help="do not pass -f to uhubctl")
     parser.add_argument("--dry-run-power", action="store_true", help="show uhubctl commands without running them")
     parser.add_argument("--meta-dir", type=Path, default=DEFAULT_META_DIR, help="directory for per-port metadata JSON")
+    parser.add_argument(
+        "--meta-filter",
+        choices=META_FILTERS,
+        default="all",
+        help="initial metadata filter for port rows",
+    )
     return parser.parse_args()
 
 
@@ -1617,6 +1663,7 @@ def main() -> int:
         force_uhubctl=not args.no_force,
         dry_run_power=args.dry_run_power,
         meta_dir=args.meta_dir,
+        meta_filter=args.meta_filter,
     )
     curses.wrapper(UsbTui(state).run)
     return 0
