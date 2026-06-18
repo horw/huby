@@ -60,6 +60,7 @@ class UsbInterface:
 class UsbDevice:
     name: str
     path: Path
+    real_path: Path | None
     parent_name: str | None
     bus: int
     port_path: tuple[int, ...] = ()
@@ -323,9 +324,14 @@ def read_interfaces(sysfs: Path, device_name: str) -> tuple[UsbInterface, ...]:
 def read_device(sysfs: Path, path: Path, bus: int, ports: tuple[int, ...], parent: str | None) -> UsbDevice:
     uevent = read_uevent(path)
     dev_name = uevent.get("DEVNAME")
+    try:
+        real_path = path.resolve(strict=False)
+    except OSError:
+        real_path = None
     return UsbDevice(
         name=path.name,
         path=path,
+        real_path=real_path,
         parent_name=parent,
         bus=bus,
         port_path=ports,
@@ -502,6 +508,8 @@ def field_lines(device: UsbDevice) -> list[str]:
         f"Location: {location_label(device)}",
         f"Sysfs: {device.path}",
     ]
+    if device.real_path and device.real_path != device.path:
+        lines.append(f"Real path: {device.real_path}")
     if device.dev_node:
         lines.append(f"USB dev node: {device.dev_node}")
 
@@ -543,13 +551,16 @@ def empty_port_lines(snapshot: Snapshot, row: ViewRow) -> list[str]:
     location = f"{parent.name} port {row.port}"
     if parent.busnum:
         location = f"bus {parent.busnum}, {location}"
-    return [
+    lines = [
         "Empty USB port",
         "Status: empty",
         f"Location: {location}",
         f"Parent hub: {device_label(parent)}",
         f"Parent sysfs: {parent.path}",
     ]
+    if parent.real_path and parent.real_path != parent.path:
+        lines.append(f"Parent real path: {parent.real_path}")
+    return lines
 
 
 class UsbTui:
