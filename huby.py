@@ -80,6 +80,10 @@ class UsbDevice:
     devnum: str | None = None
     devpath: str | None = None
     dev_node: str | None = None
+    dev_nodes: tuple[str, ...] = ()
+    serial_by_path: tuple[str, ...] = ()
+    connected_at: float | None = None
+    connected_time_source: str | None = None
     configuration: str | None = None
     authorized: str | None = None
     removable: str | None = None
@@ -321,6 +325,116 @@ def read_interfaces(sysfs: Path, device_name: str) -> tuple[UsbInterface, ...]:
     return tuple(interfaces)
 
 
+def devname_to_path(devname: str | None) -> str | None:
+    if not devname:
+        return None
+    devname = devname.strip()
+    if not devname:
+        return None
+    if devname.startswith("/dev/"):
+        return devname
+    return f"/dev/{devname}"
+
+
+def add_dev_node(nodes: list[str], devname: str | None) -> None:
+    dev_path = devname_to_path(devname)
+    if dev_path and dev_path not in nodes:
+        nodes.append(dev_path)
+
+
+def collect_dev_nodes_from_tree(path: Path, nodes: list[str], max_depth: int = 8) -> None:
+    try:
+        root = path.resolve(strict=True)
+    except OSError:
+        return
+
+    stack: list[tuple[Path, int]] = [(root, 0)]
+    seen: set[Path] = set()
+    skip_dirs = {"driver", "subsystem", "firmware_node"}
+
+    while stack:
+        current, depth = stack.pop()
+        if current in seen:
+            continue
+        seen.add(current)
+
+        uevent = read_uevent(current)
+        add_dev_node(nodes, uevent.get("DEVNAME"))
+
+        if depth >= max_depth:
+            continue
+        try:
+            children = sorted(current.iterdir(), key=lambda item: item.name, reverse=True)
+        except OSError:
+            continue
+
+        for child in children:
+            if child.name in skip_dirs or child.is_symlink():
+                continue
+            try:
+                if child.is_dir():
+                    stack.append((child, depth + 1))
+            except OSError:
+                continue
+
+
+def read_dev_nodes(sysfs: Path, device_name: str, root_devname: str | None) -> tuple[str, ...]:
+    nodes: list[str] = []
+    add_dev_node(nodes, root_devname)
+
+    try:
+        interfaces = sorted(sysfs.glob(f"{device_name}:*"), key=lambda path: path.name)
+    except OSError:
+        return tuple(nodes)
+
+    for interface_path in interfaces:
+        if interface_path.is_dir():
+            collect_dev_nodes_from_tree(interface_path, nodes)
+    return tuple(nodes)
+
+
+def read_dev_aliases(alias_dir: Path, dev_nodes: tuple[str, ...]) -> tuple[str, ...]:
+    if not dev_nodes or not alias_dir.is_dir():
+        return ()
+
+    targets: set[Path] = set()
+    for dev_node in dev_nodes:
+        try:
+            targets.add(Path(dev_node).resolve(strict=True))
+        except OSError:
+            continue
+
+    aliases: list[str] = []
+    try:
+        candidates = sorted(alias_dir.iterdir(), key=lambda path: path.name)
+    except OSError:
+        return ()
+
+    for candidate in candidates:
+        if not candidate.is_symlink():
+            continue
+        try:
+            target = candidate.resolve(strict=True)
+        except OSError:
+            continue
+        if target in targets:
+            aliases.append(str(candidate))
+    return tuple(aliases)
+
+
+def read_connection_time(path: Path) -> tuple[float | None, str | None]:
+    try:
+        stat = path.stat()
+    except OSError:
+        return None, None
+
+    if stat.st_ctime > 0:
+        return stat.st_ctime, "sysfs ctime"
+    if stat.st_mtime > 0:
+        return stat.st_mtime, "sysfs mtime"
+    return None, None
+
+
 def read_device(sysfs: Path, path: Path, bus: int, ports: tuple[int, ...], parent: str | None) -> UsbDevice:
     uevent = read_uevent(path)
     dev_name = uevent.get("DEVNAME")
@@ -328,6 +442,8 @@ def read_device(sysfs: Path, path: Path, bus: int, ports: tuple[int, ...], paren
         real_path = path.resolve(strict=False)
     except OSError:
         real_path = None
+    dev_nodes = read_dev_nodes(sysfs, path.name, dev_name)
+    connected_at, connected_time_source = read_connection_time(path)
     return UsbDevice(
         name=path.name,
         path=path,
@@ -351,6 +467,10 @@ def read_device(sysfs: Path, path: Path, bus: int, ports: tuple[int, ...], paren
         devnum=read_text(path / "devnum") or uevent.get("DEVNUM"),
         devpath=read_text(path / "devpath"),
         dev_node=f"/dev/{dev_name}" if dev_name else None,
+        dev_nodes=dev_nodes,
+        serial_by_path=read_dev_aliases(Path("/dev/serial/by-path"), dev_nodes),
+        connected_at=connected_at,
+        connected_time_source=connected_time_source,
         configuration=read_text(path / "configuration"),
         authorized=read_text(path / "authorized"),
         removable=read_text(path / "removable"),
@@ -475,6 +595,33 @@ def format_snapshot(snapshot: Snapshot, show_empty_ports: bool = True) -> str:
     return "\n".join(lines)
 
 
+def format_duration(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    days, remainder = divmod(seconds, 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes, seconds = divmod(remainder, 60)
+
+    parts: list[str] = []
+    if days:
+        parts.append(f"{days}d")
+    if hours:
+        parts.append(f"{hours}h")
+    if minutes and len(parts) < 2:
+        parts.append(f"{minutes}m")
+    if not parts:
+        parts.append(f"{seconds}s")
+    return " ".join(parts)
+
+
+def format_connected_time(device: UsbDevice) -> str | None:
+    if device.connected_at is None:
+        return None
+    timestamp = time.strftime("%Y-%m-%d %H:%M:%S %z", time.localtime(device.connected_at))
+    elapsed = format_duration(time.time() - device.connected_at)
+    source = f", {device.connected_time_source}" if device.connected_time_source else ""
+    return f"{timestamp} ({elapsed} ago{source})"
+
+
 def addstr(win: curses.window, y: int, x: int, text: str, width: int, attr: int = 0) -> None:
     if y < 0 or x < 0 or width <= 0:
         return
@@ -502,16 +649,25 @@ def clear_line(win: curses.window, y: int, attr: int = 0) -> None:
 
 
 def field_lines(device: UsbDevice) -> list[str]:
+    connected_time = format_connected_time(device)
     lines = [
         f"Name: {device.name}",
         f"Status: plugged",
         f"Location: {location_label(device)}",
-        f"Sysfs: {device.path}",
     ]
+    if connected_time:
+        lines.append(f"Connected: {connected_time}")
+    lines.append(f"Sysfs: {device.path}")
     if device.real_path and device.real_path != device.path:
         lines.append(f"Real path: {device.real_path}")
-    if device.dev_node:
-        lines.append(f"USB dev node: {device.dev_node}")
+    if device.dev_nodes:
+        lines.append("Dev nodes:")
+        for dev_node in device.dev_nodes:
+            lines.append(f"  {dev_node}")
+    if device.serial_by_path:
+        lines.append("Serial by-path:")
+        for alias in device.serial_by_path:
+            lines.append(f"  {alias}")
 
     info = [
         ("Product", device.product),
