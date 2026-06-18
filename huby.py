@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import curses
+import json
 import os
 import re
 import shlex
@@ -22,9 +23,11 @@ from typing import Deque, Iterable
 
 
 DEFAULT_SYSFS = Path("/sys/bus/usb/devices")
+DEFAULT_META_DIR = Path("/home/.huby/meta")
 ROOT_RE = re.compile(r"^usb(?P<bus>\d+)$")
 DEVICE_RE = re.compile(r"^(?P<bus>\d+)-(?P<ports>\d+(?:\.\d+)*)$")
 PORT_DIR_RE = re.compile(r".+-port(?P<port>\d+)$")
+META_FIELDS = ("name", "role", "notes")
 
 USB_CLASS_NAMES = {
     "00": "Per-interface",
@@ -165,6 +168,25 @@ class PendingPowerAction:
 
 
 @dataclass(frozen=True)
+class PortMeta:
+    hub_location: str
+    port: int
+    name: str = ""
+    role: str = ""
+    notes: str = ""
+    created_at: str = ""
+    updated_at: str = ""
+
+
+@dataclass
+class MetaEditorState:
+    target: PowerTarget
+    values: dict[str, str]
+    field_index: int = 0
+    cursor: int = 0
+
+
+@dataclass(frozen=True)
 class UsbEvent:
     timestamp: float
     action: str
@@ -183,14 +205,17 @@ class AppState:
     uhubctl_path: str
     force_uhubctl: bool
     dry_run_power: bool
+    meta_dir: Path
     snapshot: Snapshot = field(default_factory=lambda: Snapshot({}, {}, time.time()))
     rows: list[ViewRow] = field(default_factory=list)
+    port_meta: dict[tuple[str, int], PortMeta] = field(default_factory=dict)
     selected: int = 0
     top: int = 0
     events: Deque[UsbEvent] = field(default_factory=lambda: deque(maxlen=8))
     highlighted_until: dict[str, float] = field(default_factory=dict)
     last_scan: float = 0.0
     pending_power: PendingPowerAction | None = None
+    meta_edit: MetaEditorState | None = None
     status_message: str | None = None
     status_until: float = 0.0
 
@@ -370,6 +395,83 @@ def power_target_for_row(snapshot: Snapshot, row: ViewRow) -> PowerTarget | None
     return PowerTarget(hub_location=hub_location, port=row.port, label=label)
 
 
+def meta_key(target: PowerTarget) -> tuple[str, int]:
+    return target.hub_location, target.port
+
+
+def meta_filename(hub_location: str, port: int) -> str:
+    safe_location = re.sub(r"[^A-Za-z0-9_.-]+", "_", hub_location)
+    return f"{safe_location}__p{port}.json"
+
+
+def meta_path(meta_dir: Path, hub_location: str, port: int) -> Path:
+    return meta_dir / meta_filename(hub_location, port)
+
+
+def timestamp_now() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime())
+
+
+def load_port_meta(meta_dir: Path) -> dict[tuple[str, int], PortMeta]:
+    metadata: dict[tuple[str, int], PortMeta] = {}
+    if not meta_dir.is_dir():
+        return metadata
+
+    try:
+        files = sorted(meta_dir.glob("*.json"), key=lambda path: path.name)
+    except OSError:
+        return metadata
+
+    for path in files:
+        try:
+            data = json.loads(path.read_text(errors="replace"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        hub_location = str(data.get("hub_location", "")).strip()
+        try:
+            port = int(data.get("port"))
+        except (TypeError, ValueError):
+            continue
+        if not hub_location or port < 1:
+            continue
+        metadata[(hub_location, port)] = PortMeta(
+            hub_location=hub_location,
+            port=port,
+            name=str(data.get("name", "")),
+            role=str(data.get("role", "")),
+            notes=str(data.get("notes", "")),
+            created_at=str(data.get("created_at", "")),
+            updated_at=str(data.get("updated_at", "")),
+        )
+    return metadata
+
+
+def save_port_meta(meta_dir: Path, target: PowerTarget, values: dict[str, str], existing: PortMeta | None) -> PortMeta:
+    now = timestamp_now()
+    metadata = PortMeta(
+        hub_location=target.hub_location,
+        port=target.port,
+        name=values.get("name", "").strip(),
+        role=values.get("role", "").strip(),
+        notes=values.get("notes", "").strip(),
+        created_at=existing.created_at if existing and existing.created_at else now,
+        updated_at=now,
+    )
+    meta_dir.mkdir(parents=True, exist_ok=True)
+    path = meta_path(meta_dir, target.hub_location, target.port)
+    payload = {
+        "hub_location": metadata.hub_location,
+        "port": metadata.port,
+        "name": metadata.name,
+        "role": metadata.role,
+        "notes": metadata.notes,
+        "created_at": metadata.created_at,
+        "updated_at": metadata.updated_at,
+    }
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    return metadata
+
+
 def row_port_status(snapshot: Snapshot, row: ViewRow) -> UsbPortStatus | None:
     if row.parent_name is None or row.port is None:
         return None
@@ -393,6 +495,16 @@ def format_port_status_suffix(status: UsbPortStatus | None) -> str:
     if not tags:
         return ""
     return " " + " ".join(f"[{tag}]" for tag in tags)
+
+
+def format_meta_suffix(meta: PortMeta | None) -> str:
+    if not meta:
+        return ""
+    if meta.name:
+        return f" <{meta.name}>"
+    if meta.role:
+        return f" <{meta.role}>"
+    return " <meta>"
 
 
 def read_interface(path: Path) -> UsbInterface:
@@ -679,8 +791,14 @@ def scan_usb(
     return Snapshot(devices, children, time.time(), tuple(errors), port_statuses)
 
 
-def build_rows(snapshot: Snapshot, show_empty_ports: bool, highlighted: dict[str, float] | None = None) -> list[ViewRow]:
+def build_rows(
+    snapshot: Snapshot,
+    show_empty_ports: bool,
+    highlighted: dict[str, float] | None = None,
+    port_meta: dict[tuple[str, int], PortMeta] | None = None,
+) -> list[ViewRow]:
     highlighted = highlighted or {}
+    port_meta = port_meta or {}
     rows: list[ViewRow] = []
 
     def state_for(name: str) -> str:
@@ -706,6 +824,8 @@ def build_rows(snapshot: Snapshot, show_empty_ports: bool, highlighted: dict[str
             child_name = children_by_port.get(port)
             port_status = snapshot.port_statuses.get((device.name, port))
             status_suffix = format_port_status_suffix(port_status)
+            target = PowerTarget(uhubctl_location(device) or device.name, port, "")
+            meta_suffix = format_meta_suffix(port_meta.get(meta_key(target)))
             if child_name:
                 child = snapshot.devices[child_name]
                 prefix = "port %s [plugged]" % port
@@ -715,7 +835,7 @@ def build_rows(snapshot: Snapshot, show_empty_ports: bool, highlighted: dict[str
                     ViewRow(
                         kind="device",
                         depth=depth,
-                        text=f"{prefix}{status_suffix} {device_label(child)}",
+                        text=f"{prefix}{status_suffix}{meta_suffix} {device_label(child)}",
                         device_name=child.name,
                         parent_name=device.name,
                         port=port,
@@ -728,7 +848,7 @@ def build_rows(snapshot: Snapshot, show_empty_ports: bool, highlighted: dict[str
                     ViewRow(
                         kind="empty",
                         depth=depth,
-                        text=f"port {port} [empty]{status_suffix}",
+                        text=f"port {port} [empty]{status_suffix}{meta_suffix}",
                         parent_name=device.name,
                         port=port,
                         state="empty",
@@ -860,10 +980,32 @@ def port_status_lines(status: UsbPortStatus | None) -> list[str]:
     return lines
 
 
+def meta_lines(meta: PortMeta | None, target: PowerTarget | None, meta_dir: Path) -> list[str]:
+    if not target:
+        return ["Meta: unavailable"]
+    lines = ["Meta:"]
+    if meta:
+        if meta.name:
+            lines.append(f"  name: {meta.name}")
+        if meta.role:
+            lines.append(f"  role: {meta.role}")
+        if meta.notes:
+            lines.append(f"  notes: {meta.notes}")
+        if meta.updated_at:
+            lines.append(f"  updated: {meta.updated_at}")
+    else:
+        lines.append("  none")
+    lines.append(f"  file: {meta_path(meta_dir, target.hub_location, target.port)}")
+    lines.append("  edit: m")
+    return lines
+
+
 def field_lines(
     device: UsbDevice,
     target: PowerTarget | None = None,
     port_status: UsbPortStatus | None = None,
+    meta: PortMeta | None = None,
+    meta_dir: Path = DEFAULT_META_DIR,
 ) -> list[str]:
     connected_time = format_connected_time(device)
     lines = [
@@ -877,6 +1019,7 @@ def field_lines(
     if device.real_path and device.real_path != device.path:
         lines.append(f"Real path: {device.real_path}")
     lines.extend(power_target_lines(target))
+    lines.extend(meta_lines(meta, target, meta_dir))
     lines.extend(port_status_lines(port_status))
     if device.dev_nodes:
         lines.append("Dev nodes:")
@@ -922,6 +1065,8 @@ def empty_port_lines(
     row: ViewRow,
     target: PowerTarget | None = None,
     port_status: UsbPortStatus | None = None,
+    meta: PortMeta | None = None,
+    meta_dir: Path = DEFAULT_META_DIR,
 ) -> list[str]:
     parent = snapshot.devices.get(row.parent_name or "")
     if not parent:
@@ -940,6 +1085,7 @@ def empty_port_lines(
     if parent.real_path and parent.real_path != parent.path:
         lines.append(f"Parent real path: {parent.real_path}")
     lines.extend(power_target_lines(target))
+    lines.extend(meta_lines(meta, target, meta_dir))
     lines.extend(port_status_lines(port_status))
     return lines
 
@@ -959,6 +1105,7 @@ class UsbTui:
         curses.init_pair(6, curses.COLOR_CYAN, -1)
         stdscr.timeout(200)
 
+        self.state.port_meta = load_port_meta(self.state.meta_dir)
         self.refresh_snapshot(force=True, include_port_statuses=True)
         while True:
             now = time.monotonic()
@@ -1002,7 +1149,12 @@ class UsbTui:
             name: until for name, until in self.state.highlighted_until.items() if until > time.monotonic()
         }
         self.state.snapshot = new_snapshot
-        self.state.rows = build_rows(new_snapshot, self.state.show_empty_ports, self.state.highlighted_until)
+        self.state.rows = build_rows(
+            new_snapshot,
+            self.state.show_empty_ports,
+            self.state.highlighted_until,
+            self.state.port_meta,
+        )
         self.state.last_scan = time.monotonic()
         if self.state.rows:
             self.state.selected = min(self.state.selected, len(self.state.rows) - 1)
@@ -1011,10 +1163,16 @@ class UsbTui:
 
     def handle_key(self, key: int) -> bool:
         if key in (ord("q"), ord("Q"), 27):
+            if self.state.meta_edit:
+                self.cancel_meta_edit()
+                return False
             if self.state.pending_power:
                 self.cancel_power_action()
                 return False
             return True
+        if self.state.meta_edit:
+            self.handle_meta_key(key)
+            return False
         if self.state.pending_power:
             if key in (ord("y"), ord("Y")):
                 self.execute_pending_power_action()
@@ -1042,7 +1200,10 @@ class UsbTui:
         elif key in (ord("e"), ord("E")):
             self.state.show_empty_ports = not self.state.show_empty_ports
             self.state.rows = build_rows(
-                self.state.snapshot, self.state.show_empty_ports, self.state.highlighted_until
+                self.state.snapshot,
+                self.state.show_empty_ports,
+                self.state.highlighted_until,
+                self.state.port_meta,
             )
             self.state.selected = min(self.state.selected, max(0, len(self.state.rows) - 1))
         elif key in (ord("o"), ord("O")):
@@ -1051,6 +1212,8 @@ class UsbTui:
             self.prepare_power_action("on")
         elif key in (ord("c"), ord("C")):
             self.prepare_power_action("cycle")
+        elif key in (ord("m"), ord("M")):
+            self.open_meta_editor()
         return False
 
     def move_selection(self, delta: int) -> None:
@@ -1068,6 +1231,92 @@ class UsbTui:
     def set_status(self, message: str, seconds: float = 5.0) -> None:
         self.state.status_message = message
         self.state.status_until = time.monotonic() + seconds
+
+    def rebuild_rows(self) -> None:
+        self.state.rows = build_rows(
+            self.state.snapshot,
+            self.state.show_empty_ports,
+            self.state.highlighted_until,
+            self.state.port_meta,
+        )
+        self.state.selected = min(self.state.selected, max(0, len(self.state.rows) - 1))
+
+    def open_meta_editor(self) -> None:
+        row = self.selected_row()
+        target = power_target_for_row(self.state.snapshot, row) if row else None
+        if not target:
+            self.set_status("No port selected for metadata")
+            return
+
+        existing = self.state.port_meta.get(meta_key(target))
+        values = {field_name: getattr(existing, field_name, "") if existing else "" for field_name in META_FIELDS}
+        self.state.meta_edit = MetaEditorState(target=target, values=values)
+        self.set_status(f"Editing metadata for {target.hub_location}:{target.port}", seconds=3600.0)
+
+    def cancel_meta_edit(self) -> None:
+        self.state.meta_edit = None
+        self.set_status("Metadata edit cancelled", seconds=2.0)
+
+    def save_meta_edit(self) -> None:
+        editor = self.state.meta_edit
+        if not editor:
+            return
+        key = meta_key(editor.target)
+        existing = self.state.port_meta.get(key)
+        try:
+            metadata = save_port_meta(self.state.meta_dir, editor.target, editor.values, existing)
+        except OSError as exc:
+            self.set_status(f"Cannot save metadata: {exc}", seconds=8.0)
+            return
+
+        self.state.port_meta[key] = metadata
+        self.state.meta_edit = None
+        self.rebuild_rows()
+        self.set_status(f"Saved metadata: {meta_path(self.state.meta_dir, metadata.hub_location, metadata.port)}")
+
+    def handle_meta_key(self, key: int) -> None:
+        editor = self.state.meta_edit
+        if not editor:
+            return
+        field_name = META_FIELDS[editor.field_index]
+        value = editor.values.get(field_name, "")
+
+        if key in (19,):  # Ctrl-S
+            self.save_meta_edit()
+            return
+        if key in (9, curses.KEY_DOWN):
+            editor.field_index = (editor.field_index + 1) % len(META_FIELDS)
+            editor.cursor = min(editor.cursor, len(editor.values.get(META_FIELDS[editor.field_index], "")))
+            return
+        if key == curses.KEY_UP:
+            editor.field_index = (editor.field_index - 1) % len(META_FIELDS)
+            editor.cursor = min(editor.cursor, len(editor.values.get(META_FIELDS[editor.field_index], "")))
+            return
+        if key == curses.KEY_LEFT:
+            editor.cursor = max(0, editor.cursor - 1)
+            return
+        if key == curses.KEY_RIGHT:
+            editor.cursor = min(len(value), editor.cursor + 1)
+            return
+        if key == curses.KEY_HOME:
+            editor.cursor = 0
+            return
+        if key == curses.KEY_END:
+            editor.cursor = len(value)
+            return
+        if key in (curses.KEY_BACKSPACE, 127, 8):
+            if editor.cursor > 0:
+                editor.values[field_name] = value[: editor.cursor - 1] + value[editor.cursor :]
+                editor.cursor -= 1
+            return
+        if key == curses.KEY_DC:
+            if editor.cursor < len(value):
+                editor.values[field_name] = value[: editor.cursor] + value[editor.cursor + 1 :]
+            return
+        if 32 <= key <= 126:
+            character = chr(key)
+            editor.values[field_name] = value[: editor.cursor] + character + value[editor.cursor :]
+            editor.cursor += 1
 
     def prepare_power_action(self, action: str) -> None:
         row = self.selected_row()
@@ -1135,6 +1384,11 @@ class UsbTui:
     def draw(self, stdscr: curses.window) -> None:
         height, width = stdscr.getmaxyx()
         stdscr.erase()
+        if not self.state.meta_edit:
+            try:
+                curses.curs_set(0)
+            except curses.error:
+                pass
         if height < 10 or width < 60:
             addstr(stdscr, 0, 0, "Terminal is too small. Resize to at least 60x10.", width, curses.A_BOLD)
             stdscr.refresh()
@@ -1165,12 +1419,16 @@ class UsbTui:
             self.draw_details(stdscr, content_top, content_height, split + 2, width - split - 2)
 
         self.draw_events(stdscr, events_y, footer_y - events_y, width)
-        help_text = "q quit | arrows/jk select | r/F5 rescan | s port state | e empty | o off | i on | c cycle"
+        help_text = "q quit | arrows/jk select | r/F5 rescan | s port state | e empty | m meta | o off | i on | c cycle"
         if self.state.pending_power:
             help_text = "Confirm power action: y run | n cancel | Esc cancel"
+        if self.state.meta_edit:
+            help_text = "Metadata: Tab move | Ctrl-S save | Esc cancel"
         if not details_enabled:
             help_text += " | widen terminal for details"
         addstr(stdscr, footer_y, 0, help_text, width, curses.A_REVERSE)
+        if self.state.meta_edit:
+            self.draw_meta_editor(stdscr)
         stdscr.refresh()
 
     def status_line(self) -> str:
@@ -1241,11 +1499,16 @@ class UsbTui:
         row = self.state.rows[self.state.selected]
         target = power_target_for_row(self.state.snapshot, row)
         port_status = row_port_status(self.state.snapshot, row)
+        meta = self.state.port_meta.get(meta_key(target)) if target else None
         if row.device_name:
             device = self.state.snapshot.devices.get(row.device_name)
-            lines = field_lines(device, target, port_status) if device else ["Device disappeared; refresh pending."]
+            lines = (
+                field_lines(device, target, port_status, meta, self.state.meta_dir)
+                if device
+                else ["Device disappeared; refresh pending."]
+            )
         else:
-            lines = empty_port_lines(self.state.snapshot, row, target, port_status)
+            lines = empty_port_lines(self.state.snapshot, row, target, port_status, meta, self.state.meta_dir)
 
         for offset, line in enumerate(lines[:height]):
             attr = curses.A_BOLD if offset == 0 else 0
@@ -1264,6 +1527,51 @@ class UsbTui:
             text = f"{stamp} {event.action}: {event.label} at {event.location}"
             attr = curses.color_pair(3) if event.action == "plugged" else curses.color_pair(5)
             addstr(stdscr, top + index, 0, text, width, attr)
+
+    def draw_meta_editor(self, stdscr: curses.window) -> None:
+        editor = self.state.meta_edit
+        if not editor:
+            return
+
+        height, width = stdscr.getmaxyx()
+        box_width = min(max(64, width - 8), width - 2)
+        box_height = 10
+        top = max(1, (height - box_height) // 2)
+        left = max(1, (width - box_width) // 2)
+
+        for y in range(top, min(top + box_height, height - 1)):
+            addstr(stdscr, y, left, " " * box_width, box_width, curses.color_pair(2))
+
+        title = f" Edit Port Metadata: {editor.target.hub_location}:{editor.target.port} "
+        addstr(stdscr, top, left, title, box_width, curses.color_pair(1) | curses.A_BOLD)
+        addstr(
+            stdscr,
+            top + 1,
+            left + 2,
+            f"File: {meta_path(self.state.meta_dir, editor.target.hub_location, editor.target.port)}",
+            box_width - 4,
+            curses.color_pair(2),
+        )
+
+        for index, field_name in enumerate(META_FIELDS):
+            y = top + 3 + index
+            label = f"{field_name}:"
+            value = editor.values.get(field_name, "")
+            attr = curses.color_pair(2)
+            if index == editor.field_index:
+                attr |= curses.A_BOLD
+            addstr(stdscr, y, left + 2, label, 10, attr)
+            addstr(stdscr, y, left + 12, value, box_width - 14, attr)
+
+        addstr(stdscr, top + box_height - 2, left + 2, "Tab/Up/Down move  Ctrl-S save  Esc cancel", box_width - 4, curses.color_pair(2))
+
+        cursor_y = top + 3 + editor.field_index
+        cursor_x = left + 12 + min(editor.cursor, box_width - 15)
+        try:
+            stdscr.move(cursor_y, cursor_x)
+            curses.curs_set(1)
+        except curses.error:
+            pass
 
 
 def parse_args() -> argparse.Namespace:
@@ -1285,6 +1593,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--no-force", action="store_true", help="do not pass -f to uhubctl")
     parser.add_argument("--dry-run-power", action="store_true", help="show uhubctl commands without running them")
+    parser.add_argument("--meta-dir", type=Path, default=DEFAULT_META_DIR, help="directory for per-port metadata JSON")
     return parser.parse_args()
 
 
@@ -1307,6 +1616,7 @@ def main() -> int:
         uhubctl_path=args.uhubctl,
         force_uhubctl=not args.no_force,
         dry_run_power=args.dry_run_power,
+        meta_dir=args.meta_dir,
     )
     curses.wrapper(UsbTui(state).run)
     return 0
