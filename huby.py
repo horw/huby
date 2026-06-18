@@ -1281,7 +1281,7 @@ class UsbTui:
         field_name = META_FIELDS[editor.field_index]
         value = editor.values.get(field_name, "")
 
-        if key in (19,):  # Ctrl-S
+        if key in (10, 13, curses.KEY_ENTER, curses.KEY_F2, 19):  # Enter, F2, or Ctrl-S if flow control is disabled.
             self.save_meta_edit()
             return
         if key in (9, curses.KEY_DOWN):
@@ -1423,7 +1423,7 @@ class UsbTui:
         if self.state.pending_power:
             help_text = "Confirm power action: y run | n cancel | Esc cancel"
         if self.state.meta_edit:
-            help_text = "Metadata: Tab move | Ctrl-S save | Esc cancel"
+            help_text = "Metadata: Tab move | Enter/F2 save | Esc cancel"
         if not details_enabled:
             help_text += " | widen terminal for details"
         addstr(stdscr, footer_y, 0, help_text, width, curses.A_REVERSE)
@@ -1563,7 +1563,7 @@ class UsbTui:
             addstr(stdscr, y, left + 2, label, 10, attr)
             addstr(stdscr, y, left + 12, value, box_width - 14, attr)
 
-        addstr(stdscr, top + box_height - 2, left + 2, "Tab/Up/Down move  Ctrl-S save  Esc cancel", box_width - 4, curses.color_pair(2))
+        addstr(stdscr, top + box_height - 2, left + 2, "Tab/Up/Down move  Enter/F2 save  Esc cancel", box_width - 4, curses.color_pair(2))
 
         cursor_y = top + 3 + editor.field_index
         cursor_x = left + 12 + min(editor.cursor, box_width - 15)
