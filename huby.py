@@ -11,6 +11,9 @@ import argparse
 import curses
 import os
 import re
+import shlex
+import shutil
+import subprocess
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -21,6 +24,7 @@ from typing import Deque, Iterable
 DEFAULT_SYSFS = Path("/sys/bus/usb/devices")
 ROOT_RE = re.compile(r"^usb(?P<bus>\d+)$")
 DEVICE_RE = re.compile(r"^(?P<bus>\d+)-(?P<ports>\d+(?:\.\d+)*)$")
+PORT_DIR_RE = re.compile(r".+-port(?P<port>\d+)$")
 
 USB_CLASS_NAMES = {
     "00": "Per-interface",
@@ -107,11 +111,26 @@ class UsbDevice:
 
 
 @dataclass(frozen=True)
+class UsbPortStatus:
+    hub_name: str
+    port: int
+    path: Path
+    real_path: Path | None
+    state: str | None = None
+    disabled: bool | None = None
+    connect_type: str | None = None
+    location: str | None = None
+    over_current_count: str | None = None
+    peer: str | None = None
+
+
+@dataclass(frozen=True)
 class Snapshot:
     devices: dict[str, UsbDevice]
     children: dict[str, list[str]]
     scanned_at: float
     errors: tuple[str, ...] = ()
+    port_statuses: dict[tuple[str, int], UsbPortStatus] = field(default_factory=dict)
 
     @property
     def roots(self) -> list[str]:
@@ -133,6 +152,19 @@ class ViewRow:
 
 
 @dataclass(frozen=True)
+class PowerTarget:
+    hub_location: str
+    port: int
+    label: str
+
+
+@dataclass(frozen=True)
+class PendingPowerAction:
+    action: str
+    target: PowerTarget
+
+
+@dataclass(frozen=True)
 class UsbEvent:
     timestamp: float
     action: str
@@ -145,7 +177,12 @@ class UsbEvent:
 class AppState:
     sysfs: Path
     interval: float
+    auto_refresh: bool
+    auto_refresh_power_state: bool
     show_empty_ports: bool
+    uhubctl_path: str
+    force_uhubctl: bool
+    dry_run_power: bool
     snapshot: Snapshot = field(default_factory=lambda: Snapshot({}, {}, time.time()))
     rows: list[ViewRow] = field(default_factory=list)
     selected: int = 0
@@ -153,6 +190,9 @@ class AppState:
     events: Deque[UsbEvent] = field(default_factory=lambda: deque(maxlen=8))
     highlighted_until: dict[str, float] = field(default_factory=dict)
     last_scan: float = 0.0
+    pending_power: PendingPowerAction | None = None
+    status_message: str | None = None
+    status_until: float = 0.0
 
 
 def read_text(path: Path) -> str | None:
@@ -171,6 +211,13 @@ def read_int(path: Path) -> int:
         return int(value, 10)
     except ValueError:
         return 0
+
+
+def read_bool_flag(path: Path) -> bool | None:
+    value = read_text(path)
+    if value is None:
+        return None
+    return value not in {"0", "false", "False", "no", "No"}
 
 
 def read_driver(path: Path) -> str | None:
@@ -299,6 +346,53 @@ def location_label(device: UsbDevice) -> str:
     if device.physical_location:
         parts.append(f"physical {device.physical_location}")
     return ", ".join(parts)
+
+
+def uhubctl_location(device: UsbDevice) -> str | None:
+    if device.is_root:
+        return str(device.bus)
+    return device.name
+
+
+def power_target_for_row(snapshot: Snapshot, row: ViewRow) -> PowerTarget | None:
+    parent = snapshot.devices.get(row.parent_name or "")
+    if not parent or row.port is None:
+        return None
+
+    hub_location = uhubctl_location(parent)
+    if not hub_location:
+        return None
+
+    if row.device_name and row.device_name in snapshot.devices:
+        label = device_label(snapshot.devices[row.device_name])
+    else:
+        label = f"{device_label(parent)} port {row.port}"
+    return PowerTarget(hub_location=hub_location, port=row.port, label=label)
+
+
+def row_port_status(snapshot: Snapshot, row: ViewRow) -> UsbPortStatus | None:
+    if row.parent_name is None or row.port is None:
+        return None
+    return snapshot.port_statuses.get((row.parent_name, row.port))
+
+
+def port_status_tags(status: UsbPortStatus | None) -> list[str]:
+    if not status:
+        return []
+
+    tags: list[str] = []
+    if status.disabled is True:
+        tags.append("disabled")
+    if status.state:
+        tags.append(status.state)
+    return tags
+
+
+def format_port_status_suffix(status: UsbPortStatus | None) -> str:
+    tags = port_status_tags(status)
+    if not tags:
+        return ""
+    return " " + " ".join(f"[{tag}]" for tag in tags)
 
 
 def read_interface(path: Path) -> UsbInterface:
@@ -480,7 +574,74 @@ def read_device(sysfs: Path, path: Path, bus: int, ports: tuple[int, ...], paren
     )
 
 
-def scan_usb(sysfs: Path = DEFAULT_SYSFS) -> Snapshot:
+def hub_interface_paths(sysfs: Path, device: UsbDevice) -> list[Path]:
+    pattern = f"{device.bus}-0:*" if device.is_root else f"{device.name}:*"
+    try:
+        return sorted((path for path in sysfs.glob(pattern) if path.is_dir()), key=lambda path: path.name)
+    except OSError:
+        return []
+
+
+def read_peer_path(path: Path) -> str | None:
+    peer = path / "peer"
+    try:
+        if peer.is_symlink():
+            return str(peer.resolve(strict=False))
+    except OSError:
+        return None
+    return None
+
+
+def read_port_status(hub_name: str, path: Path, port: int) -> UsbPortStatus:
+    try:
+        real_path = path.resolve(strict=False)
+    except OSError:
+        real_path = None
+    return UsbPortStatus(
+        hub_name=hub_name,
+        port=port,
+        path=path,
+        real_path=real_path,
+        state=read_text(path / "state"),
+        disabled=read_bool_flag(path / "disable"),
+        connect_type=read_text(path / "connect_type"),
+        location=read_text(path / "location"),
+        over_current_count=read_text(path / "over_current_count"),
+        peer=read_peer_path(path),
+    )
+
+
+def read_port_statuses(sysfs: Path, devices: dict[str, UsbDevice]) -> dict[tuple[str, int], UsbPortStatus]:
+    statuses: dict[tuple[str, int], UsbPortStatus] = {}
+
+    for device in devices.values():
+        if not device.is_hub:
+            continue
+        for interface_path in hub_interface_paths(sysfs, device):
+            try:
+                children = sorted(interface_path.iterdir(), key=lambda item: item.name)
+            except OSError:
+                continue
+            for child in children:
+                match = PORT_DIR_RE.match(child.name)
+                if not match:
+                    continue
+                try:
+                    if not child.is_dir():
+                        continue
+                except OSError:
+                    continue
+                port = int(match.group("port"))
+                statuses[(device.name, port)] = read_port_status(device.name, child, port)
+
+    return statuses
+
+
+def scan_usb(
+    sysfs: Path = DEFAULT_SYSFS,
+    include_port_statuses: bool = True,
+    previous_port_statuses: dict[tuple[str, int], UsbPortStatus] | None = None,
+) -> Snapshot:
     errors: list[str] = []
     devices: dict[str, UsbDevice] = {}
 
@@ -511,7 +672,11 @@ def scan_usb(sysfs: Path = DEFAULT_SYSFS) -> Snapshot:
     for parent_name, child_names in list(children.items()):
         children[parent_name] = sort_device_names(child_names, devices)
 
-    return Snapshot(devices, children, time.time(), tuple(errors))
+    if include_port_statuses:
+        port_statuses = read_port_statuses(sysfs, devices)
+    else:
+        port_statuses = previous_port_statuses or {}
+    return Snapshot(devices, children, time.time(), tuple(errors), port_statuses)
 
 
 def build_rows(snapshot: Snapshot, show_empty_ports: bool, highlighted: dict[str, float] | None = None) -> list[ViewRow]:
@@ -539,6 +704,8 @@ def build_rows(snapshot: Snapshot, show_empty_ports: bool, highlighted: dict[str
 
         for port in port_numbers:
             child_name = children_by_port.get(port)
+            port_status = snapshot.port_statuses.get((device.name, port))
+            status_suffix = format_port_status_suffix(port_status)
             if child_name:
                 child = snapshot.devices[child_name]
                 prefix = "port %s [plugged]" % port
@@ -548,7 +715,7 @@ def build_rows(snapshot: Snapshot, show_empty_ports: bool, highlighted: dict[str
                     ViewRow(
                         kind="device",
                         depth=depth,
-                        text=f"{prefix} {device_label(child)}",
+                        text=f"{prefix}{status_suffix} {device_label(child)}",
                         device_name=child.name,
                         parent_name=device.name,
                         port=port,
@@ -561,7 +728,7 @@ def build_rows(snapshot: Snapshot, show_empty_ports: bool, highlighted: dict[str
                     ViewRow(
                         kind="empty",
                         depth=depth,
-                        text=f"port {port} [empty]",
+                        text=f"port {port} [empty]{status_suffix}",
                         parent_name=device.name,
                         port=port,
                         state="empty",
@@ -622,6 +789,18 @@ def format_connected_time(device: UsbDevice) -> str | None:
     return f"{timestamp} ({elapsed} ago{source})"
 
 
+def build_uhubctl_command(path: str, action: str, target: PowerTarget, force: bool) -> list[str]:
+    command = [path]
+    if force:
+        command.append("-f")
+    command.extend(["-l", target.hub_location, "-p", str(target.port), "-a", action])
+    return command
+
+
+def format_command(command: list[str]) -> str:
+    return " ".join(shlex.quote(part) for part in command)
+
+
 def addstr(win: curses.window, y: int, x: int, text: str, width: int, attr: int = 0) -> None:
     if y < 0 or x < 0 or width <= 0:
         return
@@ -648,7 +827,44 @@ def clear_line(win: curses.window, y: int, attr: int = 0) -> None:
         pass
 
 
-def field_lines(device: UsbDevice) -> list[str]:
+def power_target_lines(target: PowerTarget | None) -> list[str]:
+    if not target:
+        return ["Power target: unavailable"]
+    return [
+        f"Power target: uhubctl -l {target.hub_location} -p {target.port}",
+        "Power keys: o off, i on, c cycle",
+    ]
+
+
+def port_status_lines(status: UsbPortStatus | None) -> list[str]:
+    if not status:
+        return ["Port status: unavailable from sysfs"]
+
+    lines = ["Port status:"]
+    if status.state:
+        lines.append(f"  state: {status.state}")
+    if status.disabled is not None:
+        disabled = "yes" if status.disabled else "no"
+        lines.append(f"  disabled: {disabled}")
+    if status.connect_type:
+        lines.append(f"  connect type: {status.connect_type}")
+    if status.location:
+        lines.append(f"  location: {status.location}")
+    if status.over_current_count:
+        lines.append(f"  over-current count: {status.over_current_count}")
+    lines.append(f"  sysfs: {status.path}")
+    if status.real_path and status.real_path != status.path:
+        lines.append(f"  real path: {status.real_path}")
+    if status.peer:
+        lines.append(f"  peer: {status.peer}")
+    return lines
+
+
+def field_lines(
+    device: UsbDevice,
+    target: PowerTarget | None = None,
+    port_status: UsbPortStatus | None = None,
+) -> list[str]:
     connected_time = format_connected_time(device)
     lines = [
         f"Name: {device.name}",
@@ -660,6 +876,8 @@ def field_lines(device: UsbDevice) -> list[str]:
     lines.append(f"Sysfs: {device.path}")
     if device.real_path and device.real_path != device.path:
         lines.append(f"Real path: {device.real_path}")
+    lines.extend(power_target_lines(target))
+    lines.extend(port_status_lines(port_status))
     if device.dev_nodes:
         lines.append("Dev nodes:")
         for dev_node in device.dev_nodes:
@@ -699,7 +917,12 @@ def field_lines(device: UsbDevice) -> list[str]:
     return lines
 
 
-def empty_port_lines(snapshot: Snapshot, row: ViewRow) -> list[str]:
+def empty_port_lines(
+    snapshot: Snapshot,
+    row: ViewRow,
+    target: PowerTarget | None = None,
+    port_status: UsbPortStatus | None = None,
+) -> list[str]:
     parent = snapshot.devices.get(row.parent_name or "")
     if not parent:
         return ["Empty USB port", "Status: empty"]
@@ -716,6 +939,8 @@ def empty_port_lines(snapshot: Snapshot, row: ViewRow) -> list[str]:
     ]
     if parent.real_path and parent.real_path != parent.path:
         lines.append(f"Parent real path: {parent.real_path}")
+    lines.extend(power_target_lines(target))
+    lines.extend(port_status_lines(port_status))
     return lines
 
 
@@ -734,11 +959,11 @@ class UsbTui:
         curses.init_pair(6, curses.COLOR_CYAN, -1)
         stdscr.timeout(200)
 
-        self.refresh_snapshot(force=True)
+        self.refresh_snapshot(force=True, include_port_statuses=True)
         while True:
             now = time.monotonic()
-            if now - self.state.last_scan >= self.state.interval:
-                self.refresh_snapshot()
+            if self.state.auto_refresh and now - self.state.last_scan >= self.state.interval:
+                self.refresh_snapshot(include_port_statuses=self.state.auto_refresh_power_state)
             self.draw(stdscr)
             key = stdscr.getch()
             if key == -1:
@@ -746,9 +971,13 @@ class UsbTui:
             if self.handle_key(key):
                 break
 
-    def refresh_snapshot(self, force: bool = False) -> None:
+    def refresh_snapshot(self, force: bool = False, include_port_statuses: bool = False) -> None:
         old_snapshot = self.state.snapshot
-        new_snapshot = scan_usb(self.state.sysfs)
+        new_snapshot = scan_usb(
+            self.state.sysfs,
+            include_port_statuses=include_port_statuses,
+            previous_port_statuses=old_snapshot.port_statuses,
+        )
 
         if not force:
             old_names = set(old_snapshot.devices)
@@ -782,7 +1011,16 @@ class UsbTui:
 
     def handle_key(self, key: int) -> bool:
         if key in (ord("q"), ord("Q"), 27):
+            if self.state.pending_power:
+                self.cancel_power_action()
+                return False
             return True
+        if self.state.pending_power:
+            if key in (ord("y"), ord("Y")):
+                self.execute_pending_power_action()
+            elif key in (ord("n"), ord("N")):
+                self.cancel_power_action()
+            return False
         if key in (curses.KEY_UP, ord("k")):
             self.move_selection(-1)
         elif key in (curses.KEY_DOWN, ord("j")):
@@ -795,20 +1033,104 @@ class UsbTui:
             self.state.selected = 0
         elif key == curses.KEY_END and self.state.rows:
             self.state.selected = len(self.state.rows) - 1
-        elif key in (ord("r"), ord("R")):
-            self.refresh_snapshot(force=True)
+        elif key in (ord("r"), ord("R"), curses.KEY_F5):
+            self.refresh_snapshot(force=False, include_port_statuses=False)
+            self.set_status("Rescanned USB topology", seconds=2.0)
+        elif key in (ord("s"), ord("S")):
+            self.refresh_snapshot(force=True, include_port_statuses=True)
+            self.set_status("Refreshed sysfs port power state", seconds=2.0)
         elif key in (ord("e"), ord("E")):
             self.state.show_empty_ports = not self.state.show_empty_ports
             self.state.rows = build_rows(
                 self.state.snapshot, self.state.show_empty_ports, self.state.highlighted_until
             )
             self.state.selected = min(self.state.selected, max(0, len(self.state.rows) - 1))
+        elif key in (ord("o"), ord("O")):
+            self.prepare_power_action("off")
+        elif key in (ord("i"), ord("I")):
+            self.prepare_power_action("on")
+        elif key in (ord("c"), ord("C")):
+            self.prepare_power_action("cycle")
         return False
 
     def move_selection(self, delta: int) -> None:
         if not self.state.rows:
             return
         self.state.selected = max(0, min(len(self.state.rows) - 1, self.state.selected + delta))
+
+    def selected_row(self) -> ViewRow | None:
+        if not self.state.rows:
+            return None
+        if self.state.selected >= len(self.state.rows):
+            return None
+        return self.state.rows[self.state.selected]
+
+    def set_status(self, message: str, seconds: float = 5.0) -> None:
+        self.state.status_message = message
+        self.state.status_until = time.monotonic() + seconds
+
+    def prepare_power_action(self, action: str) -> None:
+        row = self.selected_row()
+        target = power_target_for_row(self.state.snapshot, row) if row else None
+        if not target:
+            self.set_status("No controllable upstream hub/port for selected row")
+            return
+        self.state.pending_power = PendingPowerAction(action=action, target=target)
+        command = build_uhubctl_command(self.state.uhubctl_path, action, target, self.state.force_uhubctl)
+        self.set_status(f"Confirm {action} for {target.label}: {format_command(command)}")
+
+    def cancel_power_action(self) -> None:
+        self.state.pending_power = None
+        self.set_status("Power action cancelled", seconds=2.0)
+
+    def execute_pending_power_action(self) -> None:
+        pending = self.state.pending_power
+        if not pending:
+            return
+        self.state.pending_power = None
+        command = build_uhubctl_command(
+            self.state.uhubctl_path,
+            pending.action,
+            pending.target,
+            self.state.force_uhubctl,
+        )
+        command_text = format_command(command)
+
+        if self.state.dry_run_power:
+            self.state.events.appendleft(
+                UsbEvent(time.time(), "dry-run", "", pending.target.label, command_text)
+            )
+            self.set_status(f"Dry run: {command_text}")
+            return
+
+        try:
+            result = subprocess.run(command, capture_output=True, text=True, timeout=15, check=False)
+        except FileNotFoundError:
+            self.state.events.appendleft(
+                UsbEvent(time.time(), "power failed", "", pending.target.label, f"{self.state.uhubctl_path} not found")
+            )
+            self.set_status(f"{self.state.uhubctl_path} not found")
+            return
+        except subprocess.TimeoutExpired:
+            self.state.events.appendleft(
+                UsbEvent(time.time(), "power failed", "", pending.target.label, "uhubctl timed out")
+            )
+            self.set_status("uhubctl timed out")
+            return
+
+        output = " ".join((result.stdout or result.stderr or "").split())
+        if result.returncode == 0:
+            self.state.events.appendleft(
+                UsbEvent(time.time(), f"power {pending.action}", "", pending.target.label, command_text)
+            )
+            self.set_status(f"Ran: {command_text}; press s to refresh port power state", seconds=6.0)
+            return
+
+        detail = output[:160] if output else f"exit {result.returncode}"
+        self.state.events.appendleft(
+            UsbEvent(time.time(), "power failed", "", pending.target.label, detail)
+        )
+        self.set_status(f"uhubctl failed: {detail}", seconds=8.0)
 
     def draw(self, stdscr: curses.window) -> None:
         height, width = stdscr.getmaxyx()
@@ -843,7 +1165,9 @@ class UsbTui:
             self.draw_details(stdscr, content_top, content_height, split + 2, width - split - 2)
 
         self.draw_events(stdscr, events_y, footer_y - events_y, width)
-        help_text = "q quit | arrows/jk select | r refresh | e toggle empty ports"
+        help_text = "q quit | arrows/jk select | r/F5 rescan | s port state | e empty | o off | i on | c cycle"
+        if self.state.pending_power:
+            help_text = "Confirm power action: y run | n cancel | Esc cancel"
         if not details_enabled:
             help_text += " | widen terminal for details"
         addstr(stdscr, footer_y, 0, help_text, width, curses.A_REVERSE)
@@ -855,9 +1179,21 @@ class UsbTui:
         hubs = sum(1 for dev in snapshot.devices.values() if dev.is_hub)
         empty = "shown" if self.state.show_empty_ports else "hidden"
         scanned = time.strftime("%H:%M:%S", time.localtime(snapshot.scanned_at))
-        status = f"{plugged} devices | {hubs} hubs | empty ports {empty} | scanned {scanned}"
+        refresh_mode = f"auto {self.state.interval:g}s" if self.state.auto_refresh else "manual refresh"
+        power_state_mode = "power state auto" if self.state.auto_refresh_power_state else "power state manual"
+        status = (
+            f"{plugged} devices | {hubs} hubs | empty ports {empty} | "
+            f"{refresh_mode} | {power_state_mode} | scanned {scanned}"
+        )
         if snapshot.errors:
             status += f" | {len(snapshot.errors)} read errors"
+        if self.state.dry_run_power:
+            status += " | power dry-run"
+        if self.state.pending_power:
+            pending = self.state.pending_power
+            status = f"Confirm {pending.action}: {pending.target.label} at {pending.target.hub_location}:{pending.target.port}"
+        elif self.state.status_message and self.state.status_until > time.monotonic():
+            status = self.state.status_message
         return status
 
     def draw_tree(self, stdscr: curses.window, top: int, height: int, width: int) -> None:
@@ -903,11 +1239,13 @@ class UsbTui:
         if not self.state.rows:
             return
         row = self.state.rows[self.state.selected]
+        target = power_target_for_row(self.state.snapshot, row)
+        port_status = row_port_status(self.state.snapshot, row)
         if row.device_name:
             device = self.state.snapshot.devices.get(row.device_name)
-            lines = field_lines(device) if device else ["Device disappeared; refresh pending."]
+            lines = field_lines(device, target, port_status) if device else ["Device disappeared; refresh pending."]
         else:
-            lines = empty_port_lines(self.state.snapshot, row)
+            lines = empty_port_lines(self.state.snapshot, row, target, port_status)
 
         for offset, line in enumerate(lines[:height]):
             attr = curses.A_BOLD if offset == 0 else 0
@@ -931,9 +1269,22 @@ class UsbTui:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Interactive Linux USB hub and port TUI")
     parser.add_argument("--sysfs", type=Path, default=DEFAULT_SYSFS, help="USB sysfs directory")
-    parser.add_argument("--interval", type=float, default=1.0, help="refresh interval in seconds")
+    parser.add_argument("--interval", type=float, default=1.0, help="auto-refresh interval in seconds")
+    parser.add_argument("--auto-refresh", action="store_true", help="poll USB topology instead of using manual refresh")
+    parser.add_argument(
+        "--auto-refresh-power-state",
+        action="store_true",
+        help="also refresh sysfs port power state during auto-refresh",
+    )
     parser.add_argument("--hide-empty", action="store_true", help="start with empty hub ports hidden")
     parser.add_argument("--once", action="store_true", help="print one USB tree snapshot and exit")
+    parser.add_argument(
+        "--uhubctl",
+        default=shutil.which("uhubctl") or "uhubctl",
+        help="uhubctl executable path",
+    )
+    parser.add_argument("--no-force", action="store_true", help="do not pass -f to uhubctl")
+    parser.add_argument("--dry-run-power", action="store_true", help="show uhubctl commands without running them")
     return parser.parse_args()
 
 
@@ -947,7 +1298,16 @@ def main() -> int:
         print(format_snapshot(snapshot, show_empty_ports=not args.hide_empty))
         return 1 if snapshot.errors and not snapshot.devices else 0
 
-    state = AppState(sysfs=args.sysfs, interval=args.interval, show_empty_ports=not args.hide_empty)
+    state = AppState(
+        sysfs=args.sysfs,
+        interval=args.interval,
+        auto_refresh=args.auto_refresh,
+        auto_refresh_power_state=args.auto_refresh_power_state,
+        show_empty_ports=not args.hide_empty,
+        uhubctl_path=args.uhubctl,
+        force_uhubctl=not args.no_force,
+        dry_run_power=args.dry_run_power,
+    )
     curses.wrapper(UsbTui(state).run)
     return 0
 
