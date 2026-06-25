@@ -19,7 +19,7 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Deque, Iterable
+from typing import Any, Deque, Iterable
 
 
 DEFAULT_SYSFS = Path("/sys/bus/usb/devices")
@@ -29,6 +29,23 @@ DEVICE_RE = re.compile(r"^(?P<bus>\d+)-(?P<ports>\d+(?:\.\d+)*)$")
 PORT_DIR_RE = re.compile(r".+-port(?P<port>\d+)$")
 META_FIELDS = ("name", "role", "notes")
 META_FILTERS = ("all", "with", "without")
+DEVICE_MATCH_FIELDS = {
+    "serial",
+    "id",
+    "usb_id",
+    "vidpid",
+    "vendor_product",
+    "port",
+    "port_path",
+    "location",
+    "path",
+    "dev",
+    "dev_node",
+    "dev_path",
+    "alias",
+}
+DEVICE_LABEL_FIELDS = ("name", "device", "label", "role", "port", "serial", "id", "usb_id")
+USB_ID_VALUE_RE = re.compile(r"^[0-9a-fA-F]{4}:[0-9a-fA-F]{4}$")
 
 USB_CLASS_NAMES = {
     "00": "Per-interface",
@@ -187,6 +204,35 @@ class MetaEditorState:
     cursor: int = 0
 
 
+@dataclass
+class TextPromptState:
+    title: str
+    value: str = ""
+    cursor: int = 0
+    error: str | None = None
+
+
+@dataclass(frozen=True)
+class DeviceExpectation:
+    label: str
+    criteria: dict[str, tuple[str, ...]]
+    source: str
+
+
+@dataclass(frozen=True)
+class DeviceMatch:
+    expected: DeviceExpectation
+    device: UsbDevice | None
+    matched_by: str | None = None
+
+
+@dataclass(frozen=True)
+class DeviceReport:
+    path: Path
+    matches: tuple[DeviceMatch, ...]
+    errors: tuple[str, ...] = ()
+
+
 @dataclass(frozen=True)
 class UsbEvent:
     timestamp: float
@@ -217,6 +263,8 @@ class AppState:
     last_scan: float = 0.0
     pending_power: PendingPowerAction | None = None
     meta_edit: MetaEditorState | None = None
+    device_prompt: TextPromptState | None = None
+    device_report: DeviceReport | None = None
     meta_filter: str = "all"
     status_message: str | None = None
     status_until: float = 0.0
@@ -945,6 +993,278 @@ def format_command(command: list[str]) -> str:
     return " ".join(shlex.quote(part) for part in command)
 
 
+def normalize_match_value(value: object) -> str:
+    text = str(value).strip()
+    if text.startswith("/dev/"):
+        return text
+    return re.sub(r"\s+", " ", text).lower()
+
+
+def normalize_match_values(values: Iterable[object]) -> tuple[str, ...]:
+    normalized: list[str] = []
+    for value in values:
+        text = normalize_match_value(value)
+        if text and text not in normalized:
+            normalized.append(text)
+    return tuple(normalized)
+
+
+def load_yaml_like(path: Path) -> Any:
+    text = path.read_text(errors="replace")
+    try:
+        import yaml  # type: ignore[import-not-found]
+    except ImportError:
+        return parse_simple_yaml(text)
+    loaded = yaml.safe_load(text)
+    return loaded if loaded is not None else {}
+
+
+def parse_simple_yaml(text: str) -> Any:
+    """Best-effort parser for simple runner-port YAML without requiring PyYAML."""
+    items: list[dict[str, str]] = []
+    current: dict[str, str] | None = None
+    root: dict[str, str] = {}
+
+    for raw_line in text.splitlines():
+        line = raw_line.split("#", 1)[0].rstrip()
+        if not line.strip():
+            continue
+        stripped = line.strip()
+        if stripped.startswith("- "):
+            if current:
+                items.append(current)
+            current = {}
+            stripped = stripped[2:].strip()
+            if ":" not in stripped:
+                current["name"] = stripped.strip("'\"")
+                continue
+        if ":" not in stripped:
+            continue
+        key, value = stripped.split(":", 1)
+        key = key.strip()
+        value = value.strip().strip("'\"")
+        if current is not None:
+            current[key] = value
+        else:
+            root[key] = value
+
+    if current:
+        items.append(current)
+    if items:
+        return items
+    return root
+
+
+def flatten_yaml_records(data: Any, source: str = "$") -> list[tuple[str, dict[str, Any]]]:
+    records: list[tuple[str, dict[str, Any]]] = []
+
+    if isinstance(data, list):
+        for index, item in enumerate(data):
+            records.extend(flatten_yaml_records(item, f"{source}[{index}]"))
+        return records
+
+    if not isinstance(data, dict):
+        return records
+
+    scalar_fields = {str(key): value for key, value in data.items() if not isinstance(value, (dict, list))}
+    if scalar_fields:
+        records.append((source, scalar_fields))
+
+    for key, value in data.items():
+        if isinstance(value, (dict, list)):
+            records.extend(flatten_yaml_records(value, f"{source}.{key}"))
+    return records
+
+
+def split_match_values(value: Any) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, (list, tuple, set)):
+        return normalize_match_values(item for item in value if item is not None)
+    text = str(value).strip()
+    if not text:
+        return ()
+    if "," in text:
+        return normalize_match_values(part for part in text.split(",") if part.strip())
+    return normalize_match_values((text,))
+
+
+def expectation_label(fields: dict[str, Any]) -> str:
+    for key in DEVICE_LABEL_FIELDS:
+        value = fields.get(key)
+        if value not in (None, ""):
+            return str(value).strip()
+    for key, value in fields.items():
+        if value not in (None, ""):
+            return f"{key}={value}"
+    return "unnamed device"
+
+
+def infer_device_criteria(key: str, value: Any) -> dict[str, tuple[str, ...]]:
+    values = split_match_values(value)
+    if not values:
+        return {}
+
+    if all(DEVICE_RE.match(item) for item in values):
+        return {"port_path": values}
+    if all(USB_ID_VALUE_RE.match(item) for item in values):
+        return {"usb_id": values}
+    if all(item.startswith("/dev/") for item in values):
+        return {"dev_path": values}
+    if key in {"name", "device", "label"}:
+        return {"name": values}
+    return {}
+
+
+def infer_device_expectations_from_value(key: str, value: Any, source: str) -> list[DeviceExpectation]:
+    if isinstance(value, (list, tuple, set)):
+        expectations: list[DeviceExpectation] = []
+        for index, item in enumerate(value):
+            expectations.extend(infer_device_expectations_from_value(key, item, f"{source}[{index}]"))
+        return expectations
+
+    inferred = infer_device_criteria(key, value)
+    if not inferred:
+        return []
+    port_values = inferred.get("port_path") or inferred.get("port") or ()
+    label = f"port {port_values[0]}" if port_values else str(value).strip()
+    return [DeviceExpectation(label, inferred, source)]
+
+
+def build_device_expectations(path: Path) -> list[DeviceExpectation]:
+    data = load_yaml_like(path)
+    expectations: list[DeviceExpectation] = []
+
+    for source, fields in flatten_yaml_records(data):
+        criteria: dict[str, tuple[str, ...]] = {}
+        for raw_key, value in fields.items():
+            key = raw_key.strip().lower().replace("-", "_")
+            if key not in DEVICE_MATCH_FIELDS:
+                continue
+            values = split_match_values(value)
+            if values:
+                criteria[key] = values
+        if criteria:
+            expectations.append(DeviceExpectation(expectation_label(fields), criteria, source))
+            continue
+
+        for raw_key, value in fields.items():
+            key = raw_key.strip().lower().replace("-", "_")
+            expectations.extend(infer_device_expectations_from_value(key, value, source))
+
+    if isinstance(data, dict):
+        for raw_key, value in data.items():
+            key = str(raw_key).strip().lower().replace("-", "_")
+            expectations.extend(infer_device_expectations_from_value(key, value, f"$.{raw_key}"))
+
+    return expectations
+
+
+def device_match_values(device: UsbDevice) -> dict[str, tuple[str, ...]]:
+    usb_id = device_id(device)
+    port_path = ".".join(str(part) for part in device.port_path)
+    location = location_label(device)
+    names = [device.name, device.product, device.manufacturer, device.serial]
+    return {
+        "serial": normalize_match_values((device.serial,) if device.serial else ()),
+        "id": normalize_match_values((usb_id,) if usb_id else ()),
+        "usb_id": normalize_match_values((usb_id,) if usb_id else ()),
+        "vidpid": normalize_match_values((usb_id,) if usb_id else ()),
+        "vendor_product": normalize_match_values((usb_id,) if usb_id else ()),
+        "port": normalize_match_values((port_path, device.name) if port_path else (device.name,)),
+        "port_path": normalize_match_values((port_path, device.name) if port_path else (device.name,)),
+        "location": normalize_match_values((location, device.name)),
+        "path": normalize_match_values((str(device.path), str(device.real_path or ""), device.name)),
+        "dev": normalize_match_values(device.dev_nodes),
+        "dev_node": normalize_match_values(device.dev_nodes),
+        "dev_path": normalize_match_values(device.dev_nodes),
+        "alias": normalize_match_values(device.serial_by_path),
+        "name": normalize_match_values(item for item in names if item),
+        "device": normalize_match_values(item for item in names if item),
+        "label": normalize_match_values((device_label(device),)),
+    }
+
+
+def match_expected_device(expectation: DeviceExpectation, snapshot: Snapshot) -> tuple[UsbDevice | None, str | None]:
+    for device in snapshot.devices.values():
+        if device.is_root:
+            continue
+        actual = device_match_values(device)
+        for key, expected_values in expectation.criteria.items():
+            actual_values = set(actual.get(key, ()))
+            if actual_values.intersection(expected_values):
+                return device, key
+    return None, None
+
+
+def compare_expected_devices(path: Path, snapshot: Snapshot) -> tuple[list[DeviceMatch], list[str]]:
+    errors: list[str] = []
+    try:
+        expectations = build_device_expectations(path)
+    except (OSError, ValueError, TypeError) as exc:
+        return [], [f"Cannot parse {path}: {exc}"]
+
+    if not expectations:
+        return [], [f"No device identifiers found in {path}"]
+
+    matches: list[DeviceMatch] = []
+    for expectation in expectations:
+        device, matched_by = match_expected_device(expectation, snapshot)
+        matches.append(DeviceMatch(expectation, device, matched_by))
+    return matches, errors
+
+
+def build_device_report(path: Path, snapshot: Snapshot) -> DeviceReport:
+    matches, errors = compare_expected_devices(path, snapshot)
+    return DeviceReport(path=path, matches=tuple(matches), errors=tuple(errors))
+
+
+def device_report_found_names(report: DeviceReport | None) -> set[str]:
+    if not report:
+        return set()
+    return {match.device.name for match in report.matches if match.device}
+
+
+def device_report_counts(report: DeviceReport | None) -> tuple[int, int]:
+    if not report or report.errors:
+        return 0, 0
+    found = sum(1 for match in report.matches if match.device)
+    return found, len(report.matches)
+
+
+def format_device_presence_report(path: Path, snapshot: Snapshot, max_lines: int = 12) -> list[str]:
+    report = build_device_report(path, snapshot)
+    if report.errors:
+        return list(report.errors)
+
+    present = [match for match in report.matches if match.device]
+    missing = [match for match in report.matches if not match.device]
+    lines = [
+        f"Device file: {path}",
+        f"Present: {len(present)} / {len(report.matches)}",
+    ]
+
+    if present:
+        lines.append("Presented:")
+        for match in present:
+            device = match.device
+            detail = f"{device_label(device)} at {device.name}" if device else ""
+            lines.append(f"  + {match.expected.label} -> {detail} ({match.matched_by})")
+    if missing:
+        lines.append("Not presented:")
+        for match in missing:
+            criteria = ", ".join(
+                f"{key}={';'.join(values)}" for key, values in match.expected.criteria.items()
+            )
+            lines.append(f"  - {match.expected.label} ({criteria})")
+
+    if len(lines) > max_lines:
+        hidden = len(lines) - max_lines
+        lines = lines[:max_lines]
+        lines.append(f"... {hidden} more lines; use --device-file for full report")
+    return lines
+
+
 def addstr(win: curses.window, y: int, x: int, text: str, width: int, attr: int = 0) -> None:
     if y < 0 or x < 0 or width <= 0:
         return
@@ -1114,6 +1434,36 @@ def empty_port_lines(
     return lines
 
 
+def device_report_lines(report: DeviceReport | None) -> list[tuple[str, str]]:
+    if not report:
+        return []
+    if report.errors:
+        lines = [("header", "Device File")]
+        lines.extend(("missing", error) for error in report.errors)
+        return lines
+
+    found = [match for match in report.matches if match.device]
+    missing = [match for match in report.matches if not match.device]
+    lines: list[tuple[str, str]] = [
+        ("header", "Device File"),
+        ("normal", f"{report.path.name}: {len(found)} found / {len(report.matches)} total"),
+    ]
+    if found:
+        lines.append(("header", "Found"))
+        for match in found:
+            device = match.device
+            detail = f"{device.name} {device_label(device)}" if device else match.expected.label
+            lines.append(("found", f"{match.expected.label}: {detail}"))
+    if missing:
+        lines.append(("header", "Not Found"))
+        for match in missing:
+            criteria = ", ".join(
+                f"{key}={';'.join(values)}" for key, values in match.expected.criteria.items()
+            )
+            lines.append(("missing", f"{match.expected.label}: {criteria}"))
+    return lines
+
+
 class UsbTui:
     def __init__(self, state: AppState) -> None:
         self.state = state
@@ -1127,6 +1477,7 @@ class UsbTui:
         curses.init_pair(4, curses.COLOR_BLACK, curses.COLOR_YELLOW)
         curses.init_pair(5, curses.COLOR_RED, -1)
         curses.init_pair(6, curses.COLOR_CYAN, -1)
+        curses.init_pair(7, curses.COLOR_MAGENTA, -1)
         stdscr.timeout(200)
 
         self.state.port_meta = load_port_meta(self.state.meta_dir)
@@ -1173,6 +1524,8 @@ class UsbTui:
             name: until for name, until in self.state.highlighted_until.items() if until > time.monotonic()
         }
         self.state.snapshot = new_snapshot
+        if self.state.device_report:
+            self.state.device_report = build_device_report(self.state.device_report.path, new_snapshot)
         self.state.rows = build_rows(
             new_snapshot,
             self.state.show_empty_ports,
@@ -1197,6 +1550,9 @@ class UsbTui:
             return True
         if self.state.meta_edit:
             self.handle_meta_key(key)
+            return False
+        if self.state.device_prompt:
+            self.handle_device_prompt_key(key)
             return False
         if self.state.pending_power:
             if key in (ord("y"), ord("Y")):
@@ -1242,6 +1598,8 @@ class UsbTui:
             self.open_meta_editor()
         elif key in (ord("n"), ord("N")):
             self.cycle_meta_filter()
+        elif key in (ord("d"), ord("D")):
+            self.open_device_prompt()
         return False
 
     def move_selection(self, delta: int) -> None:
@@ -1313,6 +1671,74 @@ class UsbTui:
         self.state.meta_edit = None
         self.rebuild_rows()
         self.set_status(f"Saved metadata: {meta_path(self.state.meta_dir, metadata.hub_location, metadata.port)}")
+
+    def open_device_prompt(self) -> None:
+        self.state.device_prompt = TextPromptState(title="Device YAML path")
+        self.set_status("Enter device YAML path", seconds=3600.0)
+
+    def cancel_device_prompt(self) -> None:
+        self.state.device_prompt = None
+        self.set_status("Device report cancelled", seconds=2.0)
+
+    def submit_device_prompt(self) -> None:
+        prompt = self.state.device_prompt
+        if not prompt:
+            return
+        raw_path = prompt.value.strip()
+        if not raw_path:
+            prompt.error = "Path is required"
+            return
+        path = Path(os.path.expanduser(raw_path))
+        if not path.is_absolute():
+            path = Path.cwd() / path
+        report = build_device_report(path, self.state.snapshot)
+        self.state.device_prompt = None
+        self.state.device_report = report
+        if report.errors:
+            self.set_status(report.errors[0], seconds=8.0)
+            return
+        found, total = device_report_counts(report)
+        self.set_status(f"Device file: found {found} / {total}; matched ports are purple", seconds=8.0)
+
+    def handle_device_prompt_key(self, key: int) -> None:
+        prompt = self.state.device_prompt
+        if not prompt:
+            return
+
+        if key in (27,):
+            self.cancel_device_prompt()
+            return
+        if key in (10, 13, curses.KEY_ENTER):
+            self.submit_device_prompt()
+            return
+        if key == curses.KEY_LEFT:
+            prompt.cursor = max(0, prompt.cursor - 1)
+            return
+        if key == curses.KEY_RIGHT:
+            prompt.cursor = min(len(prompt.value), prompt.cursor + 1)
+            return
+        if key == curses.KEY_HOME:
+            prompt.cursor = 0
+            return
+        if key == curses.KEY_END:
+            prompt.cursor = len(prompt.value)
+            return
+        if key in (curses.KEY_BACKSPACE, 127, 8):
+            if prompt.cursor > 0:
+                prompt.value = prompt.value[: prompt.cursor - 1] + prompt.value[prompt.cursor :]
+                prompt.cursor -= 1
+                prompt.error = None
+            return
+        if key == curses.KEY_DC:
+            if prompt.cursor < len(prompt.value):
+                prompt.value = prompt.value[: prompt.cursor] + prompt.value[prompt.cursor + 1 :]
+                prompt.error = None
+            return
+        if 32 <= key <= 126:
+            character = chr(key)
+            prompt.value = prompt.value[: prompt.cursor] + character + prompt.value[prompt.cursor :]
+            prompt.cursor += 1
+            prompt.error = None
 
     def handle_meta_key(self, key: int) -> None:
         editor = self.state.meta_edit
@@ -1446,7 +1872,11 @@ class UsbTui:
         )
 
         footer_y = height - 1
-        events_y = max(3, height - 4)
+        if self.state.device_report:
+            report_height = max(6, min(height // 2, height - 8))
+            events_y = max(3, footer_y - report_height)
+        else:
+            events_y = max(3, height - 4)
         content_top = 3
         content_bottom = events_y - 1
         content_height = max(1, content_bottom - content_top + 1)
@@ -1458,17 +1888,24 @@ class UsbTui:
             self.draw_separator(stdscr, content_top, content_height, split)
             self.draw_details(stdscr, content_top, content_height, split + 2, width - split - 2)
 
-        self.draw_events(stdscr, events_y, footer_y - events_y, width)
-        help_text = "q quit | arrows/jk select | r/F5 rescan | s port state | e empty | m meta | n notes | o off | i on | c cycle"
+        if self.state.device_report:
+            self.draw_device_report_panel(stdscr, events_y, footer_y - events_y, width)
+        else:
+            self.draw_events(stdscr, events_y, footer_y - events_y, width)
+        help_text = "q quit | arrows/jk select | r/F5 rescan | d device file | s port state | e empty | m meta | n notes | o/i/c power"
         if self.state.pending_power:
             help_text = "Confirm power action: y run | n cancel | Esc cancel"
         if self.state.meta_edit:
             help_text = "Metadata: Tab move | Enter/F2 save | Esc cancel"
+        if self.state.device_prompt:
+            help_text = "Device file: Enter run | Esc cancel"
         if not details_enabled:
             help_text += " | widen terminal for details"
         addstr(stdscr, footer_y, 0, help_text, width, curses.A_REVERSE)
         if self.state.meta_edit:
             self.draw_meta_editor(stdscr)
+        if self.state.device_prompt:
+            self.draw_device_prompt(stdscr)
         stdscr.refresh()
 
     def status_line(self) -> str:
@@ -1487,6 +1924,9 @@ class UsbTui:
             status += f" | {len(snapshot.errors)} read errors"
         if self.state.dry_run_power:
             status += " | power dry-run"
+        if self.state.device_report:
+            found, total = device_report_counts(self.state.device_report)
+            status += f" | device file {found}/{total}"
         if self.state.pending_power:
             pending = self.state.pending_power
             status = f"Confirm {pending.action}: {pending.target.label} at {pending.target.hub_location}:{pending.target.port}"
@@ -1509,6 +1949,7 @@ class UsbTui:
         self.state.top = max(0, min(self.state.top, max(0, len(rows) - height)))
 
         addstr(stdscr, top - 1, 0, "Topology", width, curses.A_BOLD)
+        report_found_names = device_report_found_names(self.state.device_report)
         for screen_line in range(height):
             row_index = self.state.top + screen_line
             if row_index >= len(rows):
@@ -1520,6 +1961,8 @@ class UsbTui:
             attr = 0
             if row_index == self.state.selected:
                 attr |= curses.color_pair(2)
+            elif row.device_name and row.device_name in report_found_names:
+                attr |= curses.color_pair(7) | curses.A_BOLD
             elif row.state == "empty":
                 attr |= curses.A_DIM
             elif row.state == "added":
@@ -1568,6 +2011,50 @@ class UsbTui:
             attr = curses.color_pair(3) if event.action == "plugged" else curses.color_pair(5)
             addstr(stdscr, top + index, 0, text, width, attr)
 
+    def draw_device_report_panel(self, stdscr: curses.window, top: int, height: int, width: int) -> None:
+        report = self.state.device_report
+        if height <= 0 or not report:
+            return
+
+        found, total = device_report_counts(report)
+        title = f"Device File Report: {report.path} ({found}/{total} found)"
+        addstr(stdscr, top, 0, title, width, curses.A_BOLD)
+
+        if report.errors:
+            for index, error in enumerate(report.errors[: max(0, height - 1)], start=1):
+                addstr(stdscr, top + index, 0, error, width, curses.color_pair(5) | curses.A_BOLD)
+            return
+
+        found_matches = [match for match in report.matches if match.device]
+        missing_matches = [match for match in report.matches if not match.device]
+        column_gap = 2
+        left_width = max(20, (width - column_gap) // 2)
+        right_x = left_width + column_gap
+        right_width = max(10, width - right_x)
+
+        addstr(stdscr, top + 1, 0, f"Found ({len(found_matches)})", left_width, curses.color_pair(7) | curses.A_BOLD)
+        addstr(stdscr, top + 1, right_x, f"Not Found ({len(missing_matches)})", right_width, curses.color_pair(5) | curses.A_BOLD)
+
+        list_height = max(0, height - 3)
+        for offset, match in enumerate(found_matches[:list_height], start=2):
+            device = match.device
+            detail = f"{match.expected.label}: {device.name} {device_label(device)}" if device else match.expected.label
+            addstr(stdscr, top + offset, 0, detail, left_width, curses.color_pair(7) | curses.A_BOLD)
+        for offset, match in enumerate(missing_matches[:list_height], start=2):
+            criteria = ", ".join(
+                f"{key}={';'.join(values)}" for key, values in match.expected.criteria.items()
+            )
+            addstr(stdscr, top + offset, right_x, f"{match.expected.label}: {criteria}", right_width, curses.color_pair(5) | curses.A_BOLD)
+
+        found_hidden = max(0, len(found_matches) - list_height)
+        missing_hidden = max(0, len(missing_matches) - list_height)
+        if height >= 3:
+            footer_y = top + height - 1
+            if found_hidden:
+                addstr(stdscr, footer_y, 0, f"... {found_hidden} more found", left_width, curses.A_DIM)
+            if missing_hidden:
+                addstr(stdscr, footer_y, right_x, f"... {missing_hidden} more not found", right_width, curses.A_DIM)
+
     def draw_meta_editor(self, stdscr: curses.window) -> None:
         editor = self.state.meta_edit
         if not editor:
@@ -1613,6 +2100,35 @@ class UsbTui:
         except curses.error:
             pass
 
+    def draw_device_prompt(self, stdscr: curses.window) -> None:
+        prompt = self.state.device_prompt
+        if not prompt:
+            return
+
+        height, width = stdscr.getmaxyx()
+        box_width = min(max(70, width - 8), width - 2)
+        box_height = 7
+        top = max(1, (height - box_height) // 2)
+        left = max(1, (width - box_width) // 2)
+
+        for y in range(top, min(top + box_height, height - 1)):
+            addstr(stdscr, y, left, " " * box_width, box_width, curses.color_pair(2))
+
+        addstr(stdscr, top, left, f" {prompt.title} ", box_width, curses.color_pair(1) | curses.A_BOLD)
+        addstr(stdscr, top + 2, left + 2, "Path:", 8, curses.color_pair(2) | curses.A_BOLD)
+        addstr(stdscr, top + 2, left + 10, prompt.value, box_width - 12, curses.color_pair(2))
+        message = prompt.error or "Example: pre_build_script/runner_ports/FA003898.yml"
+        attr = curses.color_pair(5) if prompt.error else curses.color_pair(2)
+        addstr(stdscr, top + 4, left + 2, message, box_width - 4, attr)
+        addstr(stdscr, top + box_height - 1, left + 2, "Enter run  Esc cancel", box_width - 4, curses.color_pair(2))
+
+        cursor_x = left + 10 + min(prompt.cursor, box_width - 13)
+        try:
+            stdscr.move(top + 2, cursor_x)
+            curses.curs_set(1)
+        except curses.error:
+            pass
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Interactive Linux USB hub and port TUI")
@@ -1626,6 +2142,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--hide-empty", action="store_true", help="start with empty hub ports hidden")
     parser.add_argument("--once", action="store_true", help="print one USB tree snapshot and exit")
+    parser.add_argument("--device-file", type=Path, help="print presence report for a runner-port YAML file and exit")
     parser.add_argument(
         "--uhubctl",
         default=shutil.which("uhubctl") or "uhubctl",
@@ -1647,6 +2164,11 @@ def main() -> int:
     args = parse_args()
     if args.interval < 0.2:
         args.interval = 0.2
+
+    if args.device_file:
+        snapshot = scan_usb(args.sysfs)
+        print("\n".join(format_device_presence_report(args.device_file, snapshot, max_lines=10_000)))
+        return 1 if snapshot.errors and not snapshot.devices else 0
 
     if args.once:
         snapshot = scan_usb(args.sysfs)
