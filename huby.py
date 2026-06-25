@@ -46,6 +46,7 @@ DEVICE_MATCH_FIELDS = {
 }
 DEVICE_LABEL_FIELDS = ("name", "device", "label", "role", "port", "serial", "id", "usb_id")
 USB_ID_VALUE_RE = re.compile(r"^[0-9a-fA-F]{4}:[0-9a-fA-F]{4}$")
+USB_INTERFACE_VALUE_RE = re.compile(r"^(?P<device>\d+-\d+(?:\.\d+)*):\d+\.\d+$")
 
 USB_CLASS_NAMES = {
     "00": "Per-interface",
@@ -1105,6 +1106,16 @@ def infer_device_criteria(key: str, value: Any) -> dict[str, tuple[str, ...]]:
     if not values:
         return {}
 
+    interface_devices = []
+    for item in values:
+        match = USB_INTERFACE_VALUE_RE.match(item)
+        if not match:
+            interface_devices = []
+            break
+        interface_devices.append(match.group("device"))
+    if interface_devices:
+        return {"port_path": normalize_match_values(interface_devices)}
+
     if all(DEVICE_RE.match(item) for item in values):
         return {"port_path": values}
     if all(USB_ID_VALUE_RE.match(item) for item in values):
@@ -1120,6 +1131,12 @@ def infer_device_expectations_from_value(key: str, value: Any, source: str) -> l
     if isinstance(value, (list, tuple, set)):
         expectations: list[DeviceExpectation] = []
         for index, item in enumerate(value):
+            expectations.extend(infer_device_expectations_from_value(key, item, f"{source}[{index}]"))
+        return expectations
+
+    if isinstance(value, str) and "," in value:
+        expectations = []
+        for index, item in enumerate(part.strip() for part in value.split(",") if part.strip()):
             expectations.extend(infer_device_expectations_from_value(key, item, f"{source}[{index}]"))
         return expectations
 
@@ -1157,7 +1174,15 @@ def build_device_expectations(path: Path) -> list[DeviceExpectation]:
             key = str(raw_key).strip().lower().replace("-", "_")
             expectations.extend(infer_device_expectations_from_value(key, value, f"$.{raw_key}"))
 
-    return expectations
+    deduped: list[DeviceExpectation] = []
+    seen: set[tuple[str, tuple[tuple[str, tuple[str, ...]], ...]]] = set()
+    for expectation in expectations:
+        key = (expectation.label, tuple(sorted(expectation.criteria.items())))
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(expectation)
+    return deduped
 
 
 def device_match_values(device: UsbDevice) -> dict[str, tuple[str, ...]]:
